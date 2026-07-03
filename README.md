@@ -8,7 +8,8 @@ IDUM is a *trigger effects processor*: instead of generating patterns, it
 mangles the sequences that run through it — probabilistically, in sync with
 a clock. IDOOM treats incoming MIDI notes as triggers on four virtual
 channels (like IDUM's TR1–TR4) and applies the same eight modification
-modes, plus an 8-step looper and a built-in Drift knob.
+modes, plus a 16-step looper, per-channel Split mode and a built-in
+Drift knob.
 
 > Independent reimplementation from the IDUM manual and observed behaviour
 > — not derived from Mystic Circuits' firmware. IDUM is a trademark of
@@ -23,12 +24,13 @@ modes, plus an 8-step looper and a built-in Drift knob.
 | TR1–TR4 trigger I/O   | Incoming MIDI notes; virtual channel = `note % 4` (on a drum track, pads 36/37/38/39 = TR1–TR4) |
 | CL clock input        | MIDI clock (`sync=clock`) or internal BPM (`sync=internal`); one step = 1/16 |
 | CHANCE slider         | `chance` 0–100 % — rolled every clock step              |
-| LENGTH slider         | `length` 1–8 — steps each modification lasts            |
+| LENGTH slider         | `length` 1–16 — steps each modification lasts           |
 | MODE knob             | `mode` — off + the 8 modes below                        |
 | PARAM knob            | `param` −100…+100 (bipolar, 0 = noon)                   |
-| LOOP button / gate    | `loop` on/off — 8-step looper                           |
+| LOOP button / gate    | `loop` on/off — up to 16-step looper                    |
 | CYCLE switch          | not applicable (no external sequencer to re-sync) — omitted |
-| Setup: param/length resolution | `res`: odd / even / pow2 (applies to both)     |
+| Setup: param resolution        | `param_res`: odd / even / pow2                 |
+| Setup: length resolution       | `len_res`: odd / even / pow2                   |
 
 ## The 8 modes
 
@@ -72,17 +74,26 @@ break masks.
 | `mode`   | off / 8 modes    | off      |
 | `chance` | 0–100            | 100      |
 | `param`  | −100…+100        | 0        |
-| `length` | 1–8              | 1        |
+| `length` | 1–16             | 1        |
 | `loop`   | off / on         | off      |
 | `bpm`    | 40–240           | 120      |
 | `sync`   | internal / clock | internal |
-| `res`    | odd / even / pow2| odd      |
+| `param_res` | odd / even / pow2 | odd   |
+| `len_res`   | odd / even / pow2 | odd   |
 | `drift`  | 0–100            | 0        |
+| `split`  | off / on         | off      |
 
 **Channel** keeps IDUM on a single MIDI channel so selecting a different
 Move track never gets glitched by the effect. `auto` (default) locks to
 the first channel it sees a note on; set `1–16` to pin it to your track's
 channel explicitly. Notes on any other channel pass through untouched.
+
+**Split** makes each of the four virtual channels run its **own**
+modification: with `split=off` all four share one Chance decision and
+mangle in lockstep; with `split=on` each channel rolls Chance and starts
+and ends its own modifications independently, for staggered, polyrhythmic
+IDM. Mode, Param, Length, Drift are still shared knobs — only the timing
+of each channel's modifications diverges.
 
 **Drift** is built-in modulation in a single knob: each time a
 modification activates it re-rolls Param within ±drift, and at higher

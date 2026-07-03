@@ -2,8 +2,8 @@
     "id": "idoom-fx",
     "name": "IDOOM",
     "abbrev": "IDOOM",
-    "version": "0.3.3",
-    "description": "Trigger/gate effects processor inspired by Mystic Circuits IDUM. 8 modification modes, chance, length, drift and an 8-step looper for incoming MIDI notes.",
+    "version": "0.6.0",
+    "description": "Trigger/gate effects processor inspired by Mystic Circuits IDUM. 8 modification modes, chance, length, drift, per-channel split and a 16-step looper for incoming MIDI notes.",
     "author": "dony01001",
     "license": "MIT",
     "capabilities": {
@@ -12,7 +12,7 @@
         "ui_hierarchy": {
             "levels": {
                 "root": {
-                    "name": "IDUM",
+                    "name": "IDOOM",
                     "params": [
                         {
                             "key": "mode",
@@ -42,11 +42,9 @@
                         {
                             "key": "length",
                             "name": "Length",
-                            "type": "int",
-                            "min": 1,
-                            "max": 8,
-                            "default": 1,
-                            "step": 1
+                            "type": "enum",
+                            "options": ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16"],
+                            "default": 0
                         },
                         {
                             "key": "loop",
@@ -72,8 +70,15 @@
                             "default": 0
                         },
                         {
-                            "key": "res",
-                            "name": "Resolution",
+                            "key": "param_res",
+                            "name": "Param Res",
+                            "type": "enum",
+                            "options": ["odd", "even", "pow2"],
+                            "default": 0
+                        },
+                        {
+                            "key": "len_res",
+                            "name": "Len Res",
                             "type": "enum",
                             "options": ["odd", "even", "pow2"],
                             "default": 0
@@ -86,9 +91,16 @@
                             "max": 100,
                             "default": 0,
                             "step": 1
+                        },
+                        {
+                            "key": "split",
+                            "name": "Split",
+                            "type": "enum",
+                            "options": ["off", "on"],
+                            "default": 0
                         }
                     ],
-                    "knobs": ["mode", "chance", "param", "length"]
+                    "knobs": ["mode", "chance", "param", "length", "drift", "split", "loop", "sync", "param_res", "len_res", "bpm"]
                 }
             }
         }

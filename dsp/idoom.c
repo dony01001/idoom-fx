@@ -42,7 +42,7 @@
 #include "host/plugin_api_v1.h"
 
 #define N_VCHAN          4
-#define LOOP_STEPS       8
+#define LOOP_STEPS       16
 #define LOOP_SUBTICKS    4      /* triggers captured per step per channel */
 #define BREAK_CELLS      16     /* break runs at 2x clock resolution */
 #define EVQ_SIZE         512
@@ -157,9 +157,25 @@ typedef struct {
     uint8_t  note, vel, ch;
 } ratchet_t;
 
+/* One virtual channel's modification state. In normal mode all four march
+ * in lockstep (one shared Chance decision); in Split mode each rolls and
+ * runs its own modification independently. */
+typedef struct {
+    int active;
+    int steps_left;
+    int steps_total;
+    int step_idx;        /* steps elapsed inside the modification */
+    int lmode, lparam;   /* locked at activation */
+    int mute_step;       /* SKIP left: current step is muted */
+    int prob_mod;        /* probabilityModifier: suppresses re-trigger */
+    int rot_idx;         /* ROTATE index (locked at activation) */
+    int break_preset;    /* BREAK preset (locked at activation) */
+} mod_t;
+
 typedef struct {
     /* parameters */
-    int mode, chance, param, length, loop_on, bpm, sync, res, drift;
+    int mode, chance, param, length, loop_on, bpm, sync, drift, split;
+    int param_res, len_res;   /* odd/even/pow2 quantization, split per IDUM */
 
     /* time base */
     uint64_t now;             /* sample clock, advanced each tick */
@@ -171,20 +187,10 @@ typedef struct {
     uint64_t last_clock_t;
     double   clock_interval;  /* smoothed samples per 0xF8 */
 
-    /* active modification */
-    int mod_active;
-    int mod_steps_left;
-    int mod_steps_total;
-    int mod_step_idx;         /* steps elapsed inside the modification */
-    int lmode, lparam;        /* locked at activation */
-    int mute_step;            /* SKIP left: current step is muted */
-    int prob_mod;             /* probabilityModifier: suppresses re-trigger */
+    /* active modification, one per virtual channel (see mod_t) */
+    mod_t mod[N_VCHAN];
 
-    /* ROTATE index (locked at activation) */
-    int rot_idx;
-
-    /* BREAK state */
-    int break_preset;
+    /* BREAK per-channel mask position + choke latch */
     int break_pos[N_VCHAN];   /* 0..BREAK_CELLS-1 */
     int break_latched[N_VCHAN];  /* choke: set by a note-on during the mod */
 
@@ -384,10 +390,6 @@ static void ratchet_start(idum_t *in, int vc, double period, double factor,
     in->rat[vc].next_t = in->now + (uint64_t)period;
 }
 
-static void ratchets_stop(idum_t *in) {
-    for (int v = 0; v < N_VCHAN; v++) in->rat[v].active = 0;
-}
-
 static void ratchets_fire(idum_t *in, uint8_t out_msgs[][3], int out_lens[],
                           int max_out, int *count) {
     for (int v = 0; v < N_VCHAN; v++) {
@@ -424,72 +426,79 @@ static int rot_index(int param) {
     return u / 2;                        /* 0..7 */
 }
 
-static void mod_activate(idum_t *in, int carry_over) {
-    in->mod_active = 1;
-    /* length, snapped per the resolution option (odd=1-8, even, pow2) */
-    {
-        int L = in->length < 1 ? 1 : (in->length > 8 ? 8 : in->length);
-        if (in->res == RES_EVEN && L > 1 && (L & 1)) L++;
-        else if (in->res == RES_POW2) {
-            if (L >= 6) L = 8; else if (L >= 3) L = 4;
-        }
-        if (L > 8) L = 8;
-        in->mod_steps_total = L;
+/* length snapped per the resolution option (odd=1-8, even, pow2) */
+static int snap_length(idum_t *in) {
+    int L = in->length < 1 ? 1 : (in->length > 16 ? 16 : in->length);
+    if (in->len_res == RES_EVEN && L > 1 && (L & 1)) L++;
+    else if (in->len_res == RES_POW2) {   /* 1, 2, 4, 8, 16 */
+        if (L >= 12) L = 16; else if (L >= 6) L = 8;
+        else if (L >= 3) L = 4;
     }
-    in->mod_steps_left = in->mod_steps_total;
-    in->mod_step_idx = 0;
-    in->lmode = in->mode;
-    in->lparam = in->param;
-    in->mute_step = 0;
+    if (L > 16) L = 16;
+    return L;
+}
 
-    /* Drift: internal modulation (one knob). Each modification re-rolls
-     * Param within +/-drift, and at higher settings sometimes re-picks the
-     * mode too — the spirit of IDUM's CV inputs without extra UI. */
+/* Decide the mode/param for a modification about to start, applying Drift.
+ * Called once per activation so the drift roll happens at the right moment
+ * (shared across channels in normal mode, per-channel in Split). */
+static void decide_mod(idum_t *in, int *out_mode, int *out_param) {
+    int mode = in->mode;
+    int param = in->param;
     if (in->drift > 0) {
         int span = in->drift;                       /* 0..100 */
         int off = (int)(rng_next(in) % (unsigned)(2 * span + 1)) - span;
-        int p = in->lparam + off;
-        if (p < -100) p = -100;
-        if (p > 100) p = 100;
-        in->lparam = p;
-        /* mode re-pick probability scales with drift (up to ~50%) */
+        param += off;
+        if (param < -100) param = -100;
+        if (param > 100) param = 100;
         if ((int)(rng_next(in) % 100u) < in->drift / 2) {
-            in->lmode = 1 + (int)(rng_next(in) % (unsigned)(N_MODES - 1)); /* 1..8 */
+            mode = 1 + (int)(rng_next(in) % (unsigned)(N_MODES - 1)); /* 1..8 */
         }
     }
+    *out_mode = mode;
+    *out_param = param;
+}
 
-    if (in->lmode == M_ROTATE) {
-        in->rot_idx = rot_index(in->lparam);
-    } else if (in->lmode == M_BREAK) {
-        int p = (in->lparam + 100) * (N_BREAK - 1) / 200;   /* 0..N_BREAK-1 */
+static void mod_activate(idum_t *in, int vc, int dmode, int dparam,
+                         int len, int carry_over) {
+    mod_t *m = &in->mod[vc];
+    m->active = 1;
+    m->steps_total = len;
+    m->steps_left = len;
+    m->step_idx = 0;
+    m->lmode = dmode;
+    m->lparam = dparam;
+    m->mute_step = 0;
+
+    if (m->lmode == M_ROTATE) {
+        m->rot_idx = rot_index(m->lparam);
+    } else if (m->lmode == M_BREAK) {
+        int p = (m->lparam + 100) * (N_BREAK - 1) / 200;   /* 0..N_BREAK-1 */
         if (p < 0) p = 0;
         if (p >= N_BREAK) p = N_BREAK - 1;
-        in->break_preset = p;
+        m->break_preset = p;
         if (!carry_over) {
-            /* choke: a channel stays silent until it gets a note this mod */
-            for (int v = 0; v < N_VCHAN; v++) {
-                in->break_pos[v] = 0;
-                in->break_latched[v] = 0;
-            }
+            /* choke: this channel stays silent until it gets a note this mod */
+            in->break_pos[vc] = 0;
+            in->break_latched[vc] = 0;
         }
-    } else if (in->lmode == M_SKIP) {
-        if (in->lparam > 0) {
-            /* global stutter: ratchet latched notes at clock x m */
-            int m = quant18(in->lparam, in->res);
-            for (int v = 0; v < N_VCHAN; v++) {
-                if (in->vc_has[v]) {
-                    ratchet_start(in, v, in->step_period / (double)m, 1.0,
-                                  in->vc_note[v], in->vc_vel[v], in->vc_ch[v]);
-                }
-            }
+    } else if (m->lmode == M_SKIP) {
+        if (m->lparam > 0 && in->vc_has[vc]) {
+            /* stutter: ratchet the latched note at clock x m */
+            int mm = quant18(m->lparam, in->param_res);
+            ratchet_start(in, vc, in->step_period / (double)mm, 1.0,
+                          in->vc_note[vc], in->vc_vel[vc], in->vc_ch[vc]);
         }
     }
 }
 
-static void mod_deactivate(idum_t *in) {
-    in->mod_active = 0;
-    in->mute_step = 0;
-    ratchets_stop(in);   /* their note-offs are already queued per hit */
+static void mod_deactivate(idum_t *in, int vc) {
+    in->mod[vc].active = 0;
+    in->mod[vc].mute_step = 0;
+    in->rat[vc].active = 0;   /* its note-offs are already queued per hit */
+}
+
+static void mod_deactivate_all(idum_t *in) {
+    for (int v = 0; v < N_VCHAN; v++) mod_deactivate(in, v);
 }
 
 /* ------------------------------------------------------------------ */
@@ -504,49 +513,72 @@ static void loop_clear_slot(idum_t *in, int step) {
     in->lp_plen[step] = 0;
 }
 
-/* Schedule the two BREAK cells that fall in the current step, for every
- * latched channel. Everything is queued so it works from both the tick
- * (internal sync) and process_midi (external clock) call paths. */
-static void break_emit(idum_t *in) {
+/* Schedule the two BREAK cells that fall in the current step for one
+ * latched channel. Queued so it works from both the tick (internal sync)
+ * and process_midi (external clock) call paths. */
+static void break_emit_ch(idum_t *in, int vc) {
+    if (!in->break_latched[vc]) return;
     double half = in->step_period * 0.5;
-    int p = in->break_preset;
+    int p = in->mod[vc].break_preset;
     if (p < 0 || p >= N_BREAK) return;
+    uint8_t ch = in->vc_ch[vc], nt = in->vc_note[vc], vl = in->vc_vel[vc];
     for (int h = 0; h < 2; h++) {
         uint64_t base = in->now + (uint64_t)(h * half);
-        for (int v = 0; v < N_VCHAN; v++) {
-            if (!in->break_latched[v]) continue;
-            int cell = BREAK_OWN[p][v][in->break_pos[v] % BREAK_CELLS];
-            uint8_t ch = in->vc_ch[v], nt = in->vc_note[v], vl = in->vc_vel[v];
-            if (cell == 1) {
-                if (evq_push(in, base, (uint8_t)(0x90 | ch), nt, vl))
-                    evq_push(in, base + (uint64_t)(half * 0.5),
-                             (uint8_t)(0x80 | ch), nt, 0);
-            } else if (cell >= 2) {
-                double per = half / (double)cell;
-                if (per >= min_period(in)) {
-                    for (int k = 0; k < cell; k++) {
-                        uint64_t t0 = base + (uint64_t)(per * (double)k);
-                        if (evq_push(in, t0, (uint8_t)(0x90 | ch), nt, vl))
-                            evq_push(in, t0 + (uint64_t)(per * 0.5),
-                                     (uint8_t)(0x80 | ch), nt, 0);
-                    }
+        int cell = BREAK_OWN[p][vc][in->break_pos[vc] % BREAK_CELLS];
+        if (cell == 1) {
+            if (evq_push(in, base, (uint8_t)(0x90 | ch), nt, vl))
+                evq_push(in, base + (uint64_t)(half * 0.5),
+                         (uint8_t)(0x80 | ch), nt, 0);
+        } else if (cell >= 2) {
+            double per = half / (double)cell;
+            if (per >= min_period(in)) {
+                for (int k = 0; k < cell; k++) {
+                    uint64_t t0 = base + (uint64_t)(per * (double)k);
+                    if (evq_push(in, t0, (uint8_t)(0x90 | ch), nt, vl))
+                        evq_push(in, t0 + (uint64_t)(per * 0.5),
+                                 (uint8_t)(0x80 | ch), nt, 0);
                 }
             }
-            in->break_pos[v] = (in->break_pos[v] + 1) % BREAK_CELLS;
         }
+        in->break_pos[vc] = (in->break_pos[vc] + 1) % BREAK_CELLS;
     }
 }
 
-/* Per-step action for the active modification (no length bookkeeping).
- * Runs on the activation step and every continuation step, so the mod
- * stays live through the gap where notes arrive — including length 1. */
-static void mod_step_action(idum_t *in) {
-    in->mod_step_idx++;
-    if (in->lmode == M_BREAK) {
-        break_emit(in);
-    } else if (in->lmode == M_SKIP && in->lparam < 0) {
-        int n = quant18(in->lparam, in->res);
-        in->mute_step = ((in->mod_step_idx - 1) & 7) < n;
+/* Per-step action for one channel's active modification (no length
+ * bookkeeping). Runs on the activation step and every continuation step,
+ * so the mod stays live through the gap where notes arrive — length 1
+ * included. */
+static void mod_step_action(idum_t *in, int vc) {
+    mod_t *m = &in->mod[vc];
+    m->step_idx++;
+    if (m->lmode == M_BREAK) {
+        break_emit_ch(in, vc);
+    } else if (m->lmode == M_SKIP && m->lparam < 0) {
+        int n = quant18(m->lparam, in->param_res);
+        m->mute_step = ((m->step_idx - 1) & 7) < n;
+    }
+}
+
+/* Advance one channel's modification state one step. want_start / dmode /
+ * dparam / len come from the caller's Chance decision. */
+static void step_channel(idum_t *in, int vc, int want_start,
+                         int dmode, int dparam, int len) {
+    mod_t *m = &in->mod[vc];
+    if (m->active) {
+        m->steps_left--;
+        if (m->steps_left <= 0) {
+            m->prob_mod = m->steps_total - 1;   /* suppress re-trigger */
+            mod_deactivate(in, vc);
+            if (want_start) {                    /* carryOver: bridge straight */
+                mod_activate(in, vc, dmode, dparam, len, 1);
+                mod_step_action(in, vc);
+            }
+        } else {
+            mod_step_action(in, vc);
+        }
+    } else if (want_start) {
+        mod_activate(in, vc, dmode, dparam, len, 0);
+        mod_step_action(in, vc);
     }
 }
 
@@ -594,7 +626,7 @@ static void loop_play_step(idum_t *in) {
                     case M_MULTDIV:
                     case M_BALL:
                     case M_SKIP: {
-                        int m = quant18(rparam, in->res);
+                        int m = quant18(rparam, in->param_res);
                         if (m < 2) m = 2;
                         double per = subdt / (double)m;
                         if (per >= min_period(in)) {
@@ -640,41 +672,46 @@ static int do_step(idum_t *in, uint8_t out_msgs[][3], int out_lens[],
     in->rec_pos = (in->rec_pos + 1) % LOOP_STEPS;
     loop_clear_slot(in, in->rec_pos);
 
-    /* probabilityModifier decays one notch per step */
-    if (in->prob_mod > 0) in->prob_mod--;
+    int len = snap_length(in);
 
-    /* single Chance roll used for both a fresh start and a carry-over */
-    int roll = (int)(rng_next(in) % 100u) + in->prob_mod * 9;
-    if (roll > 100) roll = 100;
-    int want_start = (in->mode != M_OFF) &&
-                     ((in->chance >= 100) ||
-                      (in->chance > 1 && roll < in->chance));
-
-    if (in->mod_active) {
-        /* a continuation step: count down first, then act if still alive.
-         * The modification stays active across its whole length (the gaps
-         * between steps), so even length 1 affects notes for one full step. */
-        in->mod_steps_left--;
-        if (in->mod_steps_left <= 0) {
-            in->prob_mod = in->mod_steps_total - 1;   /* suppress re-trigger */
-            mod_deactivate(in);
-            /* carryOver: bridge straight into another modification */
-            if (want_start) {
-                mod_activate(in, 1 /*carry*/);
-                mod_step_action(in);
-            }
-        } else {
-            mod_step_action(in);
+    if (!in->split) {
+        /* Normal mode: one Chance roll, all four channels in lockstep. */
+        for (int v = 0; v < N_VCHAN; v++)
+            if (in->mod[v].prob_mod > 0) in->mod[v].prob_mod--;
+        int roll = (int)(rng_next(in) % 100u) + in->mod[0].prob_mod * 9;
+        if (roll > 100) roll = 100;
+        int want_start = (in->mode != M_OFF) &&
+                         ((in->chance >= 100) ||
+                          (in->chance > 1 && roll < in->chance));
+        /* decide (and roll Drift) once, only when an activation will occur */
+        int dmode = in->mode, dparam = in->param;
+        int activating = want_start &&
+                         (!in->mod[0].active || in->mod[0].steps_left <= 1);
+        if (activating) decide_mod(in, &dmode, &dparam);
+        for (int v = 0; v < N_VCHAN; v++)
+            step_channel(in, v, want_start, dmode, dparam, len);
+    } else {
+        /* Split mode: each channel rolls Chance and runs its own mod. */
+        for (int v = 0; v < N_VCHAN; v++) {
+            if (in->mod[v].prob_mod > 0) in->mod[v].prob_mod--;
+            int roll = (int)(rng_next(in) % 100u) + in->mod[v].prob_mod * 9;
+            if (roll > 100) roll = 100;
+            int want = (in->mode != M_OFF) &&
+                       ((in->chance >= 100) ||
+                        (in->chance > 1 && roll < in->chance));
+            int dmode = in->mode, dparam = in->param;
+            int activating = want &&
+                             (!in->mod[v].active || in->mod[v].steps_left <= 1);
+            if (activating) decide_mod(in, &dmode, &dparam);
+            step_channel(in, v, want, dmode, dparam, len);
         }
-    } else if (want_start) {
-        mod_activate(in, 0);
-        mod_step_action(in);
     }
 
-    /* record the modification state of this step for the looper */
-    in->lp_pmode[in->rec_pos]  = (int8_t)(in->mod_active ? in->lmode : M_OFF);
-    in->lp_pparam[in->rec_pos] = (int8_t)(in->mod_active ? in->lparam : 0);
-    in->lp_plen[in->rec_pos]   = (uint8_t)(in->mod_active ? in->mod_steps_total : 0);
+    /* record this step's modification state for the looper (channel 0;
+     * playback reads the live knobs, so this is informational) */
+    in->lp_pmode[in->rec_pos]  = (int8_t)(in->mod[0].active ? in->mod[0].lmode : M_OFF);
+    in->lp_pparam[in->rec_pos] = (int8_t)(in->mod[0].active ? in->mod[0].lparam : 0);
+    in->lp_plen[in->rec_pos]   = (uint8_t)(in->mod[0].active ? in->mod[0].steps_total : 0);
 
     return 0;
 }
@@ -715,20 +752,22 @@ static int handle_note_on(idum_t *in, uint8_t ch, uint8_t note, uint8_t vel,
         return 0;
     }
 
-    if (in->mod_active && in->lmode == M_SKIP && in->mute_step) {
+    mod_t *m = &in->mod[vc];   /* this channel's modification */
+
+    if (m->active && m->lmode == M_SKIP && m->mute_step) {
         in->in_state[ch][note] = IN_SUPPRESS;
         return 0;
     }
 
-    if (!in->mod_active) {
+    if (!m->active) {
         in->in_state[ch][note] = IN_PASS;
         emit(in, out_msgs, out_lens, max_out, &count, (uint8_t)(0x90 | ch), note, vel);
         return count;
     }
 
-    switch (in->lmode) {
+    switch (m->lmode) {
         case M_HOLD:
-            if (in->lparam < 0 && roll100(in) < -in->lparam) {
+            if (m->lparam < 0 && roll100(in) < -m->lparam) {
                 in->in_state[ch][note] = IN_SUPPRESS;
                 return 0;
             }
@@ -739,9 +778,9 @@ static int handle_note_on(idum_t *in, uint8_t ch, uint8_t note, uint8_t vel,
         case M_BURST: {
             in->in_state[ch][note] = IN_PASS;
             emit(in, out_msgs, out_lens, max_out, &count, (uint8_t)(0x90 | ch), note, vel);
-            int m = quant18(in->lparam, in->res);
-            double per = (in->lparam >= 0) ? in->step_period / (double)m
-                                           : in->step_period * (double)m;
+            int mm = quant18(m->lparam, in->param_res);
+            double per = (m->lparam >= 0) ? in->step_period / (double)mm
+                                          : in->step_period * (double)mm;
             ratchet_start(in, vc, per, 1.0, note, vel, ch);
             break;
         }
@@ -751,9 +790,9 @@ static int handle_note_on(idum_t *in, uint8_t ch, uint8_t note, uint8_t vel,
             emit(in, out_msgs, out_lens, max_out, &count, (uint8_t)(0x90 | ch), note, vel);
             double base = in->vc_interval[vc] > 0.0 ? in->vc_interval[vc]
                                                     : in->step_period;
-            int m = quant18(in->lparam, in->res);
-            double per = (in->lparam >= 0) ? base / (double)m
-                                           : base * (double)m;
+            int mm = quant18(m->lparam, in->param_res);
+            double per = (m->lparam >= 0) ? base / (double)mm
+                                          : base * (double)mm;
             ratchet_start(in, vc, per, 1.0, note, vel, ch);
             break;
         }
@@ -761,21 +800,21 @@ static int handle_note_on(idum_t *in, uint8_t ch, uint8_t note, uint8_t vel,
         case M_BALL: {
             in->in_state[ch][note] = IN_PASS;
             emit(in, out_msgs, out_lens, max_out, &count, (uint8_t)(0x90 | ch), note, vel);
-            int m = quant18(in->lparam, in->res);
+            int mm = quant18(m->lparam, in->param_res);
             double start, factor;
-            if (in->lparam >= 0) {       /* expanding: fast -> slow */
-                start = in->step_period / (double)(m * 2);
-                factor = 1.0 + 0.06 * (double)m;
+            if (m->lparam >= 0) {        /* expanding: fast -> slow */
+                start = in->step_period / (double)(mm * 2);
+                factor = 1.0 + 0.06 * (double)mm;
             } else {                     /* contracting: slow -> fast */
-                start = in->step_period * (double)in->mod_steps_total / 4.0;
-                factor = 1.0 - 0.05 * (double)m;
+                start = in->step_period * (double)m->steps_total / 4.0;
+                factor = 1.0 - 0.05 * (double)mm;
             }
             ratchet_start(in, vc, start, factor, note, vel, ch);
             break;
         }
 
         case M_ROTATE: {
-            int nv = ROT_FWD[in->rot_idx][vc] & 3;
+            int nv = ROT_FWD[m->rot_idx][vc] & 3;
             uint8_t out_note = (uint8_t)((int)note - vc + nv);
             in->in_state[ch][note] = IN_REMAP;
             in->in_remap[ch][note] = out_note;
@@ -787,8 +826,8 @@ static int handle_note_on(idum_t *in, uint8_t ch, uint8_t note, uint8_t vel,
         case M_GATEDELAY: {
             double base = in->vc_interval[vc] > 0.0 ? in->vc_interval[vc]
                                                     : in->step_period;
-            int amt = quant18(in->lparam, in->res);    /* 1..8 */
-            int div = in->lparam >= 0 ? DELAY_DIV_R[vc] : DELAY_DIV_L[vc];
+            int amt = quant18(m->lparam, in->param_res);     /* 1..8 */
+            int div = m->lparam >= 0 ? DELAY_DIV_R[vc] : DELAY_DIV_L[vc];
             uint32_t d = (uint32_t)(base * (double)amt / (double)div);
             in->in_state[ch][note] = IN_DELAY;
             in->in_delay[ch][note] = d;
@@ -808,9 +847,9 @@ static int handle_note_on(idum_t *in, uint8_t ch, uint8_t note, uint8_t vel,
             /* SKIP-right: stutter — refresh the latch and join the ratchet */
             in->in_state[ch][note] = IN_PASS;
             emit(in, out_msgs, out_lens, max_out, &count, (uint8_t)(0x90 | ch), note, vel);
-            if (in->lparam > 0 && !in->rat[vc].active) {
-                int m = quant18(in->lparam, in->res);
-                ratchet_start(in, vc, in->step_period / (double)m, 1.0,
+            if (m->lparam > 0 && !in->rat[vc].active) {
+                int mm = quant18(m->lparam, in->param_res);
+                ratchet_start(in, vc, in->step_period / (double)mm, 1.0,
                               note, vel, ch);
             }
             break;
@@ -849,9 +888,10 @@ static int handle_note_off(idum_t *in, uint8_t ch, uint8_t note,
     }
 
     /* HOLD right: lengthen the gate by a % of the modification length */
-    if (in->mod_active && in->lmode == M_HOLD && in->lparam > 0) {
-        double total = in->step_period * (double)in->mod_steps_total;
-        uint64_t d = (uint64_t)(total * (double)in->lparam / 100.0);
+    mod_t *m = &in->mod[note & 3];
+    if (m->active && m->lmode == M_HOLD && m->lparam > 0) {
+        double total = in->step_period * (double)m->steps_total;
+        uint64_t d = (uint64_t)(total * (double)m->lparam / 100.0);
         evq_push(in, in->now + d, (uint8_t)(0x80 | ch), note, 0);
         return 0;
     }
@@ -876,8 +916,10 @@ static void *idum_create_instance(const char *module_dir, const char *config_jso
     in->loop_on = 0;
     in->bpm = DEFAULT_BPM;
     in->sync = SYNC_INTERNAL;
-    in->res = RES_ODD;
+    in->param_res = RES_ODD;
+    in->len_res = RES_ODD;
     in->drift = 0;
+    in->split = 0;
     in->work_ch = -1;
     in->sample_rate = 44100;
     in->rng = 0xC0FFEEu;
@@ -923,14 +965,13 @@ static int idum_process_midi(void *instance,
         if (status == 0xFA) {           /* start */
             in->clock_count = 0;
             in->clock_running = 1;
-            in->mod_active = 0;
-            in->mod_step_idx = 0;
-            ratchets_stop(in);
+            mod_deactivate_all(in);
+            for (int v = 0; v < N_VCHAN; v++) in->mod[v].step_idx = 0;
             return 0;
         }
         if (status == 0xFC) {           /* stop */
             in->clock_running = 0;
-            mod_deactivate(in);
+            mod_deactivate_all(in);
             in->flush_req = 1;
             return 0;
         }
@@ -991,7 +1032,7 @@ static int idum_tick(void *instance,
     if (in->loop_on != in->prev_loop_on) {
         in->prev_loop_on = in->loop_on;
         in->play_idx = 0;
-        mod_deactivate(in);
+        mod_deactivate_all(in);
         in->flush_req = 1;   /* release anything sounding at the boundary */
     }
 
@@ -1087,7 +1128,7 @@ static void set_one(idum_t *in, const char *key, const char *val) {
         int m = parse_mode(val);
         if (m >= 0) {
             if (m == M_OFF && in->mode != M_OFF) {
-                mod_deactivate(in);
+                mod_deactivate_all(in);
                 in->flush_req = 1;
             }
             in->mode = m;
@@ -1100,7 +1141,7 @@ static void set_one(idum_t *in, const char *key, const char *val) {
         in->param = v < -100 ? -100 : (v > 100 ? 100 : v);
     } else if (strcmp(key, "length") == 0) {
         int v = atoi(val);
-        in->length = v < 1 ? 1 : (v > 8 ? 8 : v);
+        in->length = v < 1 ? 1 : (v > 16 ? 16 : v);
     } else if (strcmp(key, "loop") == 0) {
         int idx;
         if (parse_int_str(val, &idx)) in->loop_on = idx > 0 ? 1 : 0;
@@ -1121,17 +1162,26 @@ static void set_one(idum_t *in, const char *key, const char *val) {
             in->clock_count = 0;
             in->clock_running = 1;   /* assume running, like the arp */
         }
-    } else if (strcmp(key, "res") == 0) {
-        int idx;
+    } else if (strcmp(key, "param_res") == 0 || strcmp(key, "len_res") == 0 ||
+               strcmp(key, "res") == 0) {
+        int r = -1, idx;
         if (parse_int_str(val, &idx)) {
-            if (idx >= RES_ODD && idx <= RES_POW2) in->res = idx;
+            if (idx >= RES_ODD && idx <= RES_POW2) r = idx;
         }
-        else if (strcmp(val, "odd") == 0) in->res = RES_ODD;
-        else if (strcmp(val, "even") == 0) in->res = RES_EVEN;
-        else if (strcmp(val, "pow2") == 0) in->res = RES_POW2;
+        else if (strcmp(val, "odd") == 0) r = RES_ODD;
+        else if (strcmp(val, "even") == 0) r = RES_EVEN;
+        else if (strcmp(val, "pow2") == 0) r = RES_POW2;
+        if (r >= 0) {
+            if (strcmp(key, "len_res") != 0) in->param_res = r;   /* param_res or legacy res */
+            if (strcmp(key, "param_res") != 0) in->len_res = r;   /* len_res or legacy res */
+        }
     } else if (strcmp(key, "drift") == 0) {
         int v = atoi(val);
         in->drift = v < 0 ? 0 : (v > 100 ? 100 : v);
+    } else if (strcmp(key, "split") == 0) {
+        int idx;
+        if (parse_int_str(val, &idx)) in->split = idx > 0 ? 1 : 0;
+        else in->split = (strcmp(val, "on") == 0) ? 1 : 0;
     }
 }
 
@@ -1149,8 +1199,11 @@ static void idum_set_param(void *instance, const char *key, const char *val) {
         if (json_get_string(val, "loop", s, sizeof(s))) set_one(in, "loop", s);
         if (json_get_int(val, "bpm", &v))    { char b[16]; snprintf(b, sizeof(b), "%d", v); set_one(in, "bpm", b); }
         if (json_get_string(val, "sync", s, sizeof(s))) set_one(in, "sync", s);
-        if (json_get_string(val, "res", s, sizeof(s))) set_one(in, "res", s);
+        if (json_get_string(val, "res", s, sizeof(s))) set_one(in, "res", s);   /* legacy */
+        if (json_get_string(val, "param_res", s, sizeof(s))) set_one(in, "param_res", s);
+        if (json_get_string(val, "len_res", s, sizeof(s))) set_one(in, "len_res", s);
         if (json_get_int(val, "drift", &v)) { char b[16]; snprintf(b, sizeof(b), "%d", v); set_one(in, "drift", b); }
+        if (json_get_string(val, "split", s, sizeof(s))) set_one(in, "split", s);
         return;
     }
 
@@ -1178,12 +1231,19 @@ static int idum_get_param(void *instance, const char *key, char *buf, int buf_le
     if (strcmp(key, "sync") == 0)
         return snprintf(buf, buf_len, "%s",
                         in->sync == SYNC_CLOCK ? "clock" : "internal");
-    if (strcmp(key, "res") == 0)
+    if (strcmp(key, "res") == 0 || strcmp(key, "param_res") == 0) {
+        int r = in->param_res;
         return snprintf(buf, buf_len, "%s",
-                        in->res == RES_EVEN ? "even" :
-                        in->res == RES_POW2 ? "pow2" : "odd");
+                        r == RES_EVEN ? "even" : r == RES_POW2 ? "pow2" : "odd");
+    }
+    if (strcmp(key, "len_res") == 0)
+        return snprintf(buf, buf_len, "%s",
+                        in->len_res == RES_EVEN ? "even" :
+                        in->len_res == RES_POW2 ? "pow2" : "odd");
     if (strcmp(key, "drift") == 0)
         return snprintf(buf, buf_len, "%d", in->drift);
+    if (strcmp(key, "split") == 0)
+        return snprintf(buf, buf_len, "%s", in->split ? "on" : "off");
 
     if (strcmp(key, "error") == 0) {
         if (in->sync != SYNC_CLOCK) { buf[0] = '\0'; return 0; }
@@ -1201,12 +1261,14 @@ static int idum_get_param(void *instance, const char *key, char *buf, int buf_le
     if (strcmp(key, "state") == 0) {
         return snprintf(buf, buf_len,
             "{\"mode\":\"%s\",\"chance\":%d,\"param\":%d,\"length\":%d,"
-            "\"loop\":\"%s\",\"bpm\":%d,\"sync\":\"%s\",\"res\":\"%s\",\"drift\":%d}",
+            "\"loop\":\"%s\",\"bpm\":%d,\"sync\":\"%s\",\"param_res\":\"%s\","
+            "\"len_res\":\"%s\",\"drift\":%d,\"split\":\"%s\"}",
             MODE_NAMES[in->mode], in->chance, in->param, in->length,
             in->loop_on ? "on" : "off", in->bpm,
             in->sync == SYNC_CLOCK ? "clock" : "internal",
-            in->res == RES_EVEN ? "even" : in->res == RES_POW2 ? "pow2" : "odd",
-            in->drift);
+            in->param_res == RES_EVEN ? "even" : in->param_res == RES_POW2 ? "pow2" : "odd",
+            in->len_res == RES_EVEN ? "even" : in->len_res == RES_POW2 ? "pow2" : "odd",
+            in->drift, in->split ? "on" : "off");
     }
 
     if (strcmp(key, "chain_params") == 0) {
@@ -1216,12 +1278,16 @@ static int idum_get_param(void *instance, const char *key, char *buf, int buf_le
                 "\"gatedelay\",\"break\",\"skip\"]},"
             "{\"key\":\"chance\",\"name\":\"Chance\",\"type\":\"int\",\"min\":0,\"max\":100,\"step\":1},"
             "{\"key\":\"param\",\"name\":\"Param\",\"type\":\"int\",\"min\":-100,\"max\":100,\"step\":1},"
-            "{\"key\":\"length\",\"name\":\"Length\",\"type\":\"int\",\"min\":1,\"max\":8,\"step\":1},"
+            "{\"key\":\"length\",\"name\":\"Length\",\"type\":\"enum\","
+                "\"options\":[\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\","
+                "\"9\",\"10\",\"11\",\"12\",\"13\",\"14\",\"15\",\"16\"]},"
             "{\"key\":\"loop\",\"name\":\"Loop\",\"type\":\"enum\",\"options\":[\"off\",\"on\"]},"
             "{\"key\":\"bpm\",\"name\":\"BPM\",\"type\":\"int\",\"min\":40,\"max\":240,\"step\":1},"
             "{\"key\":\"sync\",\"name\":\"Sync\",\"type\":\"enum\",\"options\":[\"internal\",\"clock\"]},"
-            "{\"key\":\"res\",\"name\":\"Resolution\",\"type\":\"enum\",\"options\":[\"odd\",\"even\",\"pow2\"]},"
-            "{\"key\":\"drift\",\"name\":\"Drift\",\"type\":\"int\",\"min\":0,\"max\":100,\"step\":1}"
+            "{\"key\":\"param_res\",\"name\":\"Param Res\",\"type\":\"enum\",\"options\":[\"odd\",\"even\",\"pow2\"]},"
+            "{\"key\":\"len_res\",\"name\":\"Len Res\",\"type\":\"enum\",\"options\":[\"odd\",\"even\",\"pow2\"]},"
+            "{\"key\":\"drift\",\"name\":\"Drift\",\"type\":\"int\",\"min\":0,\"max\":100,\"step\":1},"
+            "{\"key\":\"split\",\"name\":\"Split\",\"type\":\"enum\",\"options\":[\"off\",\"on\"]}"
         "]";
         return snprintf(buf, buf_len, "%s", params);
     }
