@@ -1,0 +1,96 @@
+{
+    "id": "idoom-fx",
+    "name": "IDOOM",
+    "abbrev": "IDOOM",
+    "version": "0.3.3",
+    "description": "Trigger/gate effects processor inspired by Mystic Circuits IDUM. 8 modification modes, chance, length, drift and an 8-step looper for incoming MIDI notes.",
+    "author": "dony01001",
+    "license": "MIT",
+    "capabilities": {
+        "chainable": true,
+        "component_type": "midi_fx",
+        "ui_hierarchy": {
+            "levels": {
+                "root": {
+                    "name": "IDUM",
+                    "params": [
+                        {
+                            "key": "mode",
+                            "name": "Mode",
+                            "type": "enum",
+                            "options": ["off", "hold", "burst", "multdiv", "ball", "rotate", "gatedelay", "break", "skip"],
+                            "default": 0
+                        },
+                        {
+                            "key": "chance",
+                            "name": "Chance",
+                            "type": "int",
+                            "min": 0,
+                            "max": 100,
+                            "default": 100,
+                            "step": 1
+                        },
+                        {
+                            "key": "param",
+                            "name": "Param",
+                            "type": "int",
+                            "min": -100,
+                            "max": 100,
+                            "default": 0,
+                            "step": 1
+                        },
+                        {
+                            "key": "length",
+                            "name": "Length",
+                            "type": "int",
+                            "min": 1,
+                            "max": 8,
+                            "default": 1,
+                            "step": 1
+                        },
+                        {
+                            "key": "loop",
+                            "name": "Loop",
+                            "type": "enum",
+                            "options": ["off", "on"],
+                            "default": 0
+                        },
+                        {
+                            "key": "bpm",
+                            "name": "BPM",
+                            "type": "int",
+                            "min": 40,
+                            "max": 240,
+                            "default": 120,
+                            "step": 1
+                        },
+                        {
+                            "key": "sync",
+                            "name": "Sync",
+                            "type": "enum",
+                            "options": ["internal", "clock"],
+                            "default": 0
+                        },
+                        {
+                            "key": "res",
+                            "name": "Resolution",
+                            "type": "enum",
+                            "options": ["odd", "even", "pow2"],
+                            "default": 0
+                        },
+                        {
+                            "key": "drift",
+                            "name": "Drift",
+                            "type": "int",
+                            "min": 0,
+                            "max": 100,
+                            "default": 0,
+                            "step": 1
+                        }
+                    ],
+                    "knobs": ["mode", "chance", "param", "length"]
+                }
+            }
+        }
+    }
+}
